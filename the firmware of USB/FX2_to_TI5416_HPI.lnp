@@ -1,0 +1,12 @@
+"fw.obj",
+"dscr.obj",
+"FX2_to_TI5416_HPI.obj",
+"int0.obj",
+"gpif.obj",
+"C:\Cypress\USB\Target\Lib\LP\EZUSB.LIB",
+"C:\Cypress\USB\Target\Lib\LP\USBJmpTb.OBJ" 
+TO "FX2_to_TI5416_HPI" 
+RAMSIZE(256) 
+DISABLEWARNING (16) 
+CODE( 0x80-0x0FFF )
+XDATA( 0x1000 )

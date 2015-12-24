@@ -1,0 +1,33 @@
+C51 COMPILER V8.02   INT0                                                                  05/09/2014 16:29:57 PAGE 1   
+
+
+C51 COMPILER V8.02, COMPILATION OF MODULE INT0
+OBJECT MODULE PLACED IN int0.OBJ
+COMPILER INVOKED BY: C:\Keil\C51\BIN\C51.EXE int0.c OPTIMIZE(6,SPEED) DEBUG OBJECTEXTEND
+
+line level    source
+
+   1          #include "fx2.h"
+   2          #include "fx2regs.h"
+   3          
+   4          extern BOOL hpi_int;
+   5          
+   6          void int0_isr (void) interrupt 0
+   7          { 
+   8   1        hpi_int = TRUE; // HPI interrupted the FX2
+   9   1        EX0 = 0;        // disable INT0/ interrupt, let foreground re-enable it
+  10   1      }
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =      5    ----
+   CONSTANT SIZE    =   ----    ----
+   XDATA SIZE       =   ----    ----
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =   ----    ----
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =   ----    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

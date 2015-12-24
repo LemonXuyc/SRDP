@@ -1,0 +1,713 @@
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 1   
+
+
+C51 COMPILER V8.02, COMPILATION OF MODULE FX2_TO_TI5416_HPI
+OBJECT MODULE PLACED IN FX2_to_TI5416_HPI.OBJ
+COMPILER INVOKED BY: C:\Keil\C51\BIN\C51.EXE FX2_to_TI5416_HPI.c OPTIMIZE(6,SPEED) DEBUG OBJECTEXTEND
+
+line level    source
+
+   1          #pragma NOIV               // Do not generate interrupt vectors
+   2          //-----------------------------------------------------------------------------
+   3          //   File:       FX2_to_extsyncFIFO.c
+   4          //   Contents:   Hooks required to implement FX2 GPIF interface to a TI
+   5          //               5416 DSP via it's HPI (Host Port Interface)
+   6          //
+   7          //   Copyright (c) 2002 Cypress Semiconductor, Inc. All rights reserved
+   8          //-----------------------------------------------------------------------------
+   9          #include "fx2.h"
+  10          #include "fx2regs.h"
+  11          #include "fx2sdly.h"            // SYNCDELAY macro, see Section 15.14 of FX2 Tech.
+  12                                          // Ref. Manual for usage details.
+  13          
+  14          #define HPI_RDY       GPIFREADYSTAT & bmBIT0 // RDY0
+  15          #define LED_ALL       (bmBIT0 | bmBIT1 | bmBIT2 | bmBIT3)
+  16          #define bmEP0BSY      0x01
+  17          #define bmEP1OUTBSY   0x02
+  18          #define bmEP1INBSY    0x04
+  19          
+  20          #define bmHPIC        0x00 // HCNTL[1:0] = 00
+  21          #define bmHPID_AUTO   0x04 // HCNTL[1:0] = 01
+  22          #define bmHPIA        0x08 // HCNTL[1:0] = 10
+  23          #define bmHPID_MANUAL 0x0C // HCNTL[1:0] = 11
+  24          
+  25          #define GPIFTRIGRD 4
+  26          
+  27          #define GPIF_EP2 0
+  28          #define GPIF_EP4 1
+  29          #define GPIF_EP6 2
+  30          #define GPIF_EP8 3
+  31          
+  32          extern BOOL GotSUD;               // Received setup data flag
+  33          extern BOOL Sleep;
+  34          extern BOOL Rwuen;
+  35          extern BOOL Selfpwr;
+  36          
+  37          BYTE Configuration;               // Current configuration
+  38          BYTE AlternateSetting;            // Alternate settings
+  39          static WORD xdata LED_Count = 0;
+  40          static BYTE xdata LED_Status = 0;
+  41          BOOL in_enable = FALSE;           // flag to enable IN transfers
+  42          BOOL hpi_int = FALSE;             // HPI interrupt flag
+  43          static WORD xdata Tcount = 0;     // transaction count
+  44          BOOL enum_high_speed = FALSE;     // flag to let firmware know FX2 enumerated at high speed
+  45          static WORD xFIFOBC_IN = 0x0000;  // variable that contains EP6FIFOBCH/L value
+  46          
+  47          //-----------------------------------------------------------------------------
+  48          // Task Dispatcher hooks
+  49          // The following hooks are called by the task dispatcher.
+  50          //-----------------------------------------------------------------------------
+  51          void LED_Off (BYTE LED_Mask);
+  52          void LED_On (BYTE LED_Mask);
+  53          void GpifInit ();
+  54          
+  55          void GPIF_SingleByteWrite (BYTE gdata)
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 2   
+
+  56          {
+  57   1        while( !( GPIFTRIG & 0x80 ) )  // poll GPIFTRIG.7 Done bit
+  58   1        {
+  59   2           ;
+  60   2        }
+  61   1      
+  62   1        XGPIFSGLDATLX = gdata;         // trigger GPIF Single Byte Write transaction
+  63   1      }
+  64          
+  65          
+  66          void GPIF_SingleWordWrite (BYTE gdath,BYTE gdatl)
+  67          {
+  68   1        while( !( GPIFTRIG & 0x80 ) )  // poll GPIFTRIG.7 Done bit
+  69   1        {
+  70   2           ;
+  71   2        }
+  72   1        XGPIFSGLDATH  = gdath;
+  73   1        XGPIFSGLDATLX = gdatl;         // trigger GPIF Single Byte Write transaction
+  74   1       }
+  75          
+  76          void TD_Init(void)             // Called once at startup
+  77          {
+  78   1        // set the CPU clock to 48MHz
+  79   1        CPUCS = ((CPUCS & ~bmCLKSPD) | bmCLKSPD1);
+  80   1        SYNCDELAY;
+  81   1      
+  82   1        EP1OUTCFG = 0xA0;  // always OUT, valid, bulk
+  83   1        EP1INCFG = 0xA0;   // always IN, valid, bulk
+  84   1        SYNCDELAY;
+  85   1        EP2CFG = 0xA0;     // EP2OUT, bulk, size 512, 4x buffered
+  86   1        SYNCDELAY;                    
+  87   1        EP4CFG = 0x00;     // EP4 not valid
+  88   1        SYNCDELAY;                    
+  89   1        EP6CFG = 0xE0;     // EP6IN, bulk, size 512, 4x buffered
+  90   1        SYNCDELAY;                    
+  91   1        EP8CFG = 0x00;     // EP8 not valid
+  92   1        SYNCDELAY;
+  93   1      
+  94   1        FIFORESET = 0x80;  // set NAKALL bit to NAK all transfers from host
+  95   1        SYNCDELAY;
+  96   1        FIFORESET = 0x02;  // reset EP2 FIFO
+  97   1        SYNCDELAY;
+  98   1        FIFORESET = 0x06;  // reset EP6 FIFO
+  99   1        SYNCDELAY;
+ 100   1        FIFORESET = 0x00;  // clear NAKALL bit to resume normal operation
+ 101   1        SYNCDELAY;
+ 102   1      
+ 103   1        EP2FIFOCFG = 0x01; // allow core to see zero to one transition of auto out bit
+ 104   1        SYNCDELAY;
+ 105   1        EP2FIFOCFG = 0x11; // auto out mode, disable PKTEND zero length send, byte ops
+ 106   1        SYNCDELAY;
+ 107   1        EP6FIFOCFG = 0x09; // auto in mode, disable PKTEND zero length send, byte ops
+ 108   1        SYNCDELAY;
+ 109   1        EP1OUTBC = 0x00;   // arm EP1OUT by writing any value to EP1OUTBC register
+ 110   1      
+ 111   1        GpifInit ();       // initialize GPIF registers  
+ 112   1         
+ 113   1        PORTACFG = bmBIT0; // PA0 takes on INT0/ alternate function
+ 114   1        OEA  |= 0x1C;      // initialize PA3 and PA2 port i/o pins as outputs  
+ 115   1        OEC |= 0x03;           //定义PC0和PC1作为输出引脚
+ 116   1        EX0 = 1;           // Enable INT0/ interrupt
+ 117   1        IT0 = 1;           // Detect INT0/ on falling edge
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 3   
+
+ 118   1      }
+ 119          
+ 120          void TD_Poll(void)
+ 121          {
+ 122   1      
+ 123   1        if( GPIFTRIG & 0x80 )              // if GPIF interface IDLE
+ 124   1        {
+ 125   2          if ( ! ( EP24FIFOFLGS & 0x02 ) ) // if there's a packet in the peripheral domain for EP2
+ 126   2          {
+ 127   3            IOA = bmHPID_AUTO;             // select HPID register with address auto-increment
+ 128   3                while(!HPI_RDY);               // wait for HPI to complete internal portion of previous transfer
+ 129   3          
+ 130   3                SYNCDELAY;
+ 131   3            GPIFTCB1 = EP2FIFOBCH;         // setup transaction count with number of bytes in the EP2 FIFO
+ 132   3            SYNCDELAY;
+ 133   3            GPIFTCB0 = EP2FIFOBCL;
+ 134   3            SYNCDELAY;
+ 135   3            GPIFTRIG = GPIF_EP2;           // launch GPIF FIFO WRITE Transaction from EP2 FIFO
+ 136   3            SYNCDELAY;
+ 137   3      
+ 138   3                while( !( GPIFTRIG & 0x80 ) )  // poll GPIFTRIG.7 GPIF Done bit
+ 139   3            {
+ 140   4              ;
+ 141   4            }
+ 142   3            SYNCDELAY;      
+ 143   3          
+ 144   3          }
+ 145   2        }
+ 146   1          
+ 147   1        if(in_enable)                             // if IN transfers are enabled,
+ 148   1        {     
+ 149   2          if(Tcount)                              // if Tcount is not zero
+ 150   2              {
+ 151   3            if( GPIFTRIG & 0x80 )                 // if GPIF interface IDLE
+ 152   3            {
+ 153   4              if( !( EP68FIFOFLGS & 0x01 ) )      // if EP6 FIFO is not full
+ 154   4              {
+ 155   5                    IOA = bmHPID_AUTO;                // select HPID register with address auto-increment              
+ 156   5                while(!HPI_RDY);                  // wait for HPI to complete internal portion of previous trans
+             -fer
+ 157   5                         
+ 158   5                SYNCDELAY;
+ 159   5                    GPIFTCB1 = MSB(Tcount);           // setup transaction count with Tcount value     
+ 160   5                SYNCDELAY;
+ 161   5                GPIFTCB0 = LSB(Tcount);
+ 162   5                SYNCDELAY;   
+ 163   5      
+ 164   5                GPIFTRIG = GPIFTRIGRD | GPIF_EP6; // launch GPIF FIFO READ Transaction to EP6IN
+ 165   5                    SYNCDELAY;
+ 166   5      
+ 167   5                    while( !( GPIFTRIG & 0x80 ) )     // poll GPIFTRIG.7 GPIF Done bit
+ 168   5                {
+ 169   6                  ;
+ 170   6                }
+ 171   5          
+ 172   5                    SYNCDELAY;
+ 173   5      
+ 174   5                        xFIFOBC_IN = ( ( EP6FIFOBCH << 8 ) + EP6FIFOBCL ); // get EP6FIFOBCH/L value
+ 175   5      
+ 176   5                        if( xFIFOBC_IN < 0x0200 )         // if pkt is short,
+ 177   5                        {
+ 178   6                          INPKTEND = 0x06;                // force a commit to the host
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 4   
+
+ 179   6                }
+ 180   5                        Tcount = 0;                       // set Tcount to zero to cease reading from DSP HPI RAM
+ 181   5              }                   
+ 182   4            }
+ 183   3          }
+ 184   2        }  
+ 185   1      
+ 186   1        if(!(EP01STAT & bmEP1OUTBSY))
+ 187   1        {
+ 188   2          // handle OUTs to EP1OUT
+ 189   2        }
+ 190   1      
+ 191   1        if(!(EP01STAT & bmEP1INBSY))
+ 192   1        {
+ 193   2          // handle INs to EP1IN
+ 194   2        }
+ 195   1      
+ 196   1        if (hpi_int)
+ 197   1        {
+ 198   2          hpi_int = FALSE; // clear HPI interrupt flag
+ 199   2              EX0 = 1;         // enable INT0 interrupt again
+ 200   2              LED_On (bmBIT1); // turn on LED1 to alert user HPI interrupt occurred
+ 201   2        }
+ 202   1        
+ 203   1        // blink LED0 to indicate firmware is running
+ 204   1      
+ 205   1        if (++LED_Count == 10000)
+ 206   1        {
+ 207   2          if (LED_Status)
+ 208   2          {
+ 209   3            LED_Off (bmBIT0);
+ 210   3            LED_Status = 0;
+ 211   3          }
+ 212   2          else
+ 213   2          {
+ 214   3            LED_On (bmBIT0);
+ 215   3            LED_Status = 1;
+ 216   3          }
+ 217   2          LED_Count = 0;
+ 218   2        }
+ 219   1      
+ 220   1      }
+ 221          
+ 222          BOOL TD_Suspend(void)          // Called before the device goes into suspend mode
+ 223          {
+ 224   1         return(TRUE);
+ 225   1      }
+ 226          
+ 227          BOOL TD_Resume(void)          // Called after the device resumes
+ 228          {
+ 229   1         return(TRUE);
+ 230   1      }
+ 231          
+ 232          //-----------------------------------------------------------------------------
+ 233          // Device Request hooks
+ 234          //   The following hooks are called by the end point 0 device request parser.
+ 235          //-----------------------------------------------------------------------------
+ 236          
+ 237          BOOL DR_GetDescriptor(void)
+ 238          {
+ 239   1         return(TRUE);
+ 240   1      }
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 5   
+
+ 241          
+ 242          BOOL DR_SetConfiguration(void)  // Called when a Set Configuration command is received
+ 243          {
+ 244   1      
+ 245   1        if( EZUSB_HIGHSPEED( ) )
+ 246   1        { // FX2 enumerated at high speed
+ 247   2          SYNCDELAY;                  
+ 248   2          EP6AUTOINLENH = 0x02;       // set AUTOIN commit length to 512 bytes
+ 249   2          SYNCDELAY;                  
+ 250   2          EP6AUTOINLENL = 0x00;
+ 251   2          SYNCDELAY;                  
+ 252   2          enum_high_speed = TRUE;
+ 253   2        }
+ 254   1        else
+ 255   1        { // FX2 enumerated at full speed
+ 256   2          SYNCDELAY;                   
+ 257   2          EP6AUTOINLENH = 0x00;       // set AUTOIN commit length to 64 bytes
+ 258   2          SYNCDELAY;                   
+ 259   2          EP6AUTOINLENL = 0x40;
+ 260   2          SYNCDELAY;                  
+ 261   2          enum_high_speed = FALSE;
+ 262   2        }
+ 263   1        
+ 264   1        Configuration = SETUPDAT[2];
+ 265   1        return(TRUE);                 // Handled by user code
+ 266   1      }
+ 267          
+ 268          BOOL DR_GetConfiguration(void)   // Called when a Get Configuration command is received
+ 269          {
+ 270   1         EP0BUF[0] = Configuration;
+ 271   1         EP0BCH = 0;
+ 272   1         EP0BCL = 1;
+ 273   1         return(TRUE);            // Handled by user code
+ 274   1      }
+ 275          
+ 276          BOOL DR_SetInterface(void)       // Called when a Set Interface command is received
+ 277          {
+ 278   1         AlternateSetting = SETUPDAT[2];
+ 279   1         return(TRUE);            // Handled by user code
+ 280   1      }
+ 281          
+ 282          BOOL DR_GetInterface(void)       // Called when a Set Interface command is received
+ 283          {
+ 284   1         EP0BUF[0] = AlternateSetting;
+ 285   1         EP0BCH = 0;
+ 286   1         EP0BCL = 1;
+ 287   1         return(TRUE);            // Handled by user code
+ 288   1      }
+ 289          
+ 290          BOOL DR_GetStatus(void)
+ 291          {
+ 292   1         return(TRUE);
+ 293   1      }
+ 294          
+ 295          BOOL DR_ClearFeature(void)
+ 296          {
+ 297   1         return(TRUE);
+ 298   1      }
+ 299          
+ 300          BOOL DR_SetFeature(void)
+ 301          {
+ 302   1         return(TRUE);
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 6   
+
+ 303   1      }
+ 304          
+ 305          #define VX_B2 0xB2 // turn off LED1
+ 306          #define VX_B3 0xB3 // enable IN transfers
+ 307          #define VX_B4 0xB4 // disable IN transfers
+ 308          #define VX_B5 0xB5 // set Tcount value
+ 309          #define VX_B6 0xB6 // write to HPIC register
+ 310          #define VX_B7 0xB7 // write to HPIA register
+ 311          #define VX_B8 0xB8 // reset EP6 FIFO
+ 312          #define VX_B9 0xB9 // read GPIFTRIG register
+ 313          #define VX_BA 0xBA // read GPIFTC registers
+ 314          #define VX_BB 0xBB
+ 315          BOOL DR_VendorCmnd(void)
+ 316          {
+ 317   1      
+ 318   1        switch (SETUPDAT[1])
+ 319   1        {
+ 320   2          case VX_B2: // turn off LED1
+ 321   2          {       
+ 322   3            LED_Off (bmBIT1);
+ 323   3      
+ 324   3            *EP0BUF = VX_B2;
+ 325   3                EP0BCH = 0;
+ 326   3                EP0BCL = 1;                   // Arm endpoint with # bytes to transfer
+ 327   3                EP0CS |= bmHSNAK;             // Acknowledge handshake phase of device request
+ 328   3            break;
+ 329   3          }
+ 330   2              case VX_B3: // enable IN transfers
+ 331   2              {
+ 332   3                in_enable = TRUE;
+ 333   3      
+ 334   3            *EP0BUF = VX_B3;
+ 335   3                EP0BCH = 0;
+ 336   3                EP0BCL = 1;
+ 337   3                EP0CS |= bmHSNAK;
+ 338   3                break;
+ 339   3          }
+ 340   2              case VX_B4: // disable IN transfers
+ 341   2              {
+ 342   3                in_enable = FALSE;
+ 343   3      
+ 344   3            *EP0BUF = VX_B4;
+ 345   3                EP0BCH = 0;
+ 346   3                EP0BCL = 1;
+ 347   3                EP0CS |= bmHSNAK;
+ 348   3                break;
+ 349   3          }
+ 350   2              case VX_B5: // set Tcount value
+ 351   2              {
+ 352   3                EP0BCL = 0;
+ 353   3                while(EP01STAT & bmEP0BSY);             // wait until EP0 is available to be accessed by CPU
+ 354   3                Tcount = (EP0BUF[0] << 8) + EP0BUF[1];  // load transaction count with EP0 values
+ 355   3                
+ 356   3                break;
+ 357   3          }
+ 358   2              case VX_B6: // write to HPIC register
+ 359   2              {         
+ 360   3                EP0BCL = 0;                         // re-arm EP0
+ 361   3                while(EP01STAT & bmEP0BSY);         // wait until EP0 is available to be accessed by CPU
+ 362   3                while(!HPI_RDY);                    // wait for HPI to complete internal portion of previous transfer
+ 363   3            IOA = bmHPIC;                       // select HPIC register
+ 364   3                GPIFWFSELECT = 0x1E;                // point to waveforms that write first byte of HPI protocol
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 7   
+
+ 365   3           // GPIF_SingleByteWrite(EP0BUF[0]);    // write LSB of DSP address
+ 366   3                GPIF_SingleWordWrite(EP0BUF[1],EP0BUF[0]);
+ 367   3                GPIFWFSELECT = 0x4E;                // point to waveforms that write second byte of HPI protocol
+ 368   3               // GPIF_SingleByteWrite(EP0BUF[1]);    // write MSB of DSP address               
+ 369   3                GPIF_SingleWordWrite(EP0BUF[3],EP0BUF[2]);
+ 370   3                break;
+ 371   3          }
+ 372   2              case VX_B7: // write to HPIA register
+ 373   2              {         
+ 374   3                EP0BCL = 0;                         // re-arm EP0
+ 375   3                while(EP01STAT & bmEP0BSY);         // wait until EP0 is available to be accessed by CPU
+ 376   3                while(!HPI_RDY);                    // wait for HPI to complete internal portion of previous transfer
+ 377   3            IOA = bmHPIA;                       // select HPIA register
+ 378   3                GPIFWFSELECT = 0x1E;                // point to waveforms that write first byte of HPI protocol
+ 379   3           // GPIF_SingleByteWrite(EP0BUF[0]);    // write LSB of DSP address
+ 380   3                GPIF_SingleWordWrite(EP0BUF[1],EP0BUF[0]);
+ 381   3                GPIFWFSELECT = 0x4E;                // point to waveforms that write second byte of HPI protocol
+ 382   3                //GPIF_SingleByteWrite(EP0BUF[1]);    // write MSB of DSP address             
+ 383   3                GPIF_SingleWordWrite(EP0BUF[3],EP0BUF[2]);
+ 384   3                break;
+ 385   3          }
+ 386   2              case VX_B8: // reset EP6 FIFO
+ 387   2              {         
+ 388   3                FIFORESET = 0x80; // set NAKALL bit to NAK all transfers from host
+ 389   3            SYNCDELAY;
+ 390   3            FIFORESET = 0x06; // reset EP6 FIFO
+ 391   3            SYNCDELAY;
+ 392   3            FIFORESET = 0x00; // clear NAKALL bit to resume normal operation
+ 393   3            SYNCDELAY;
+ 394   3      
+ 395   3            *EP0BUF = VX_B8;
+ 396   3                EP0BCH = 0;
+ 397   3                EP0BCL = 1;
+ 398   3                EP0CS |= bmHSNAK;
+ 399   3      
+ 400   3                break;
+ 401   3          }
+ 402   2              case VX_B9: // read GPIFTRIG register
+ 403   2              {         
+ 404   3                EP0BUF[0] = VX_B9;
+ 405   3                EP0BUF[1] = GPIFTRIG;
+ 406   3                EP0BCH = 0;
+ 407   3                EP0BCL = 2;
+ 408   3                EP0CS |= bmHSNAK;
+ 409   3                break;
+ 410   3          }
+ 411   2              case VX_BA: // read GPIFTC registers
+ 412   2              {         
+ 413   3                EP0BUF[0] = VX_BA;
+ 414   3                EP0BUF[1] = GPIFTCB1;
+ 415   3                EP0BUF[2] = GPIFTCB0;
+ 416   3                EP0BCH = 0;
+ 417   3                EP0BCL = 3;
+ 418   3                EP0CS |= bmHSNAK;
+ 419   3                break;
+ 420   3          }
+ 421   2              case VX_BB: //          产生reset，写入0xFFE701*************
+ 422   2              {
+ 423   3                EP0BCL = 0;                         // re-arm EP0
+ 424   3                while(!HPI_RDY);
+ 425   3                GPIFCTLCFG=0x00;
+ 426   3                IOA = 0x10;
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 8   
+
+ 427   3                GPIFIDLECTL=0x02;                 
+ 428   3                GPIFWFSELECT = 0x1E;   
+ 429   3                GPIF_SingleWordWrite(EP0BUF[1],EP0BUF[0]);
+ 430   3                IOA=0x00;
+ 431   3                break;
+ 432   3          }
+ 433   2          default:
+ 434   2              return(TRUE);
+ 435   2        }
+ 436   1      
+ 437   1        return(FALSE);
+ 438   1      }
+ 439          
+ 440          //-----------------------------------------------------------------------------
+ 441          // USB Interrupt Handlers
+ 442          //   The following functions are called by the USB interrupt jump table.
+ 443          //-----------------------------------------------------------------------------
+ 444          
+ 445          // Setup Data Available Interrupt Handler
+ 446          void ISR_Sudav(void) interrupt 0
+ 447          {
+ 448   1         GotSUD = TRUE;            // Set flag
+ 449   1         EZUSB_IRQ_CLEAR();
+ 450   1         USBIRQ = bmSUDAV;         // Clear SUDAV IRQ
+ 451   1      }
+ 452          
+ 453          // Setup Token Interrupt Handler
+ 454          void ISR_Sutok(void) interrupt 0
+ 455          {
+ 456   1         EZUSB_IRQ_CLEAR();
+ 457   1         USBIRQ = bmSUTOK;         // Clear SUTOK IRQ
+ 458   1      }
+ 459          
+ 460          void ISR_Sof(void) interrupt 0
+ 461          {
+ 462   1         EZUSB_IRQ_CLEAR();
+ 463   1         USBIRQ = bmSOF;            // Clear SOF IRQ
+ 464   1      }
+ 465          
+ 466          void ISR_Ures(void) interrupt 0
+ 467          {
+ 468   1         // whenever we get a USB reset, we should revert to full speed mode
+ 469   1         pConfigDscr = pFullSpeedConfigDscr;
+ 470   1         ((CONFIGDSCR xdata *) pConfigDscr)->type = CONFIG_DSCR;
+ 471   1         pOtherConfigDscr = pHighSpeedConfigDscr;
+ 472   1         ((CONFIGDSCR xdata *) pOtherConfigDscr)->type = OTHERSPEED_DSCR;
+ 473   1      
+ 474   1         EZUSB_IRQ_CLEAR();
+ 475   1         USBIRQ = bmURES;         // Clear URES IRQ
+ 476   1      }
+ 477          
+ 478          void ISR_Susp(void) interrupt 0
+ 479          {
+ 480   1         Sleep = TRUE;
+ 481   1         EZUSB_IRQ_CLEAR();
+ 482   1         USBIRQ = bmSUSP;
+ 483   1      }
+ 484          
+ 485          void ISR_Highspeed(void) interrupt 0
+ 486          {
+ 487   1         if (EZUSB_HIGHSPEED())
+ 488   1         {
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 9   
+
+ 489   2            pConfigDscr = pHighSpeedConfigDscr;
+ 490   2            ((CONFIGDSCR xdata *) pConfigDscr)->type = CONFIG_DSCR;
+ 491   2            pOtherConfigDscr = pFullSpeedConfigDscr;
+ 492   2            ((CONFIGDSCR xdata *) pOtherConfigDscr)->type = OTHERSPEED_DSCR;
+ 493   2         }
+ 494   1      
+ 495   1         EZUSB_IRQ_CLEAR();
+ 496   1         USBIRQ = bmHSGRANT;
+ 497   1      }
+ 498          void ISR_Ep0ack(void) interrupt 0
+ 499          {
+ 500   1      }
+ 501          void ISR_Stub(void) interrupt 0
+ 502          {
+ 503   1      }
+ 504          void ISR_Ep0in(void) interrupt 0
+ 505          {
+ 506   1      }
+ 507          void ISR_Ep0out(void) interrupt 0
+ 508          {
+ 509   1      }
+ 510          void ISR_Ep1in(void) interrupt 0
+ 511          {
+ 512   1      }
+ 513          void ISR_Ep1out(void) interrupt 0
+ 514          {
+ 515   1      }
+ 516          void ISR_Ep2inout(void) interrupt 0
+ 517          {
+ 518   1      }
+ 519          void ISR_Ep4inout(void) interrupt 0
+ 520          {
+ 521   1      }
+ 522          void ISR_Ep6inout(void) interrupt 0
+ 523          {
+ 524   1      }
+ 525          void ISR_Ep8inout(void) interrupt 0
+ 526          {
+ 527   1      }
+ 528          void ISR_Ibn(void) interrupt 0
+ 529          {
+ 530   1      }
+ 531          void ISR_Ep0pingnak(void) interrupt 0
+ 532          {
+ 533   1      }
+ 534          void ISR_Ep1pingnak(void) interrupt 0
+ 535          {
+ 536   1      }
+ 537          void ISR_Ep2pingnak(void) interrupt 0
+ 538          {
+ 539   1      }
+ 540          void ISR_Ep4pingnak(void) interrupt 0
+ 541          {
+ 542   1      }
+ 543          void ISR_Ep6pingnak(void) interrupt 0
+ 544          {
+ 545   1      }
+ 546          void ISR_Ep8pingnak(void) interrupt 0
+ 547          {
+ 548   1      }
+ 549          void ISR_Errorlimit(void) interrupt 0
+ 550          {
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 10  
+
+ 551   1      }
+ 552          void ISR_Ep2piderror(void) interrupt 0
+ 553          {
+ 554   1      }
+ 555          void ISR_Ep4piderror(void) interrupt 0
+ 556          {
+ 557   1      }
+ 558          void ISR_Ep6piderror(void) interrupt 0
+ 559          {
+ 560   1      }
+ 561          void ISR_Ep8piderror(void) interrupt 0
+ 562          {
+ 563   1      }
+ 564          void ISR_Ep2pflag(void) interrupt 0
+ 565          {
+ 566   1      }
+ 567          void ISR_Ep4pflag(void) interrupt 0
+ 568          {
+ 569   1      }
+ 570          void ISR_Ep6pflag(void) interrupt 0
+ 571          {
+ 572   1      }
+ 573          void ISR_Ep8pflag(void) interrupt 0
+ 574          {
+ 575   1      }
+ 576          void ISR_Ep2eflag(void) interrupt 0
+ 577          {
+ 578   1      }
+ 579          void ISR_Ep4eflag(void) interrupt 0
+ 580          {
+ 581   1      }
+ 582          void ISR_Ep6eflag(void) interrupt 0
+ 583          {
+ 584   1      }
+ 585          void ISR_Ep8eflag(void) interrupt 0
+ 586          {
+ 587   1      }
+ 588          void ISR_Ep2fflag(void) interrupt 0
+ 589          {
+ 590   1      }
+ 591          void ISR_Ep4fflag(void) interrupt 0
+ 592          {
+ 593   1      }
+ 594          void ISR_Ep6fflag(void) interrupt 0
+ 595          {
+ 596   1      }
+ 597          void ISR_Ep8fflag(void) interrupt 0
+ 598          {
+ 599   1      }
+ 600          void ISR_GpifComplete(void) interrupt 0
+ 601          {
+ 602   1      }
+ 603          void ISR_GpifWaveform(void) interrupt 0
+ 604          {
+ 605   1      }
+ 606          
+ 607          // ...debug LEDs: accessed via movx reads only ( through CPLD )
+ 608          // it may be worth noting here that the default monitor loads at 0xC000
+ 609          xdata volatile const BYTE LED0_ON  _at_ 0x8000;
+ 610          xdata volatile const BYTE LED0_OFF _at_ 0x8100;
+ 611          xdata volatile const BYTE LED1_ON  _at_ 0x9000;
+ 612          xdata volatile const BYTE LED1_OFF _at_ 0x9100;
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 11  
+
+ 613          xdata volatile const BYTE LED2_ON  _at_ 0xA000;
+ 614          xdata volatile const BYTE LED2_OFF _at_ 0xA100;
+ 615          xdata volatile const BYTE LED3_ON  _at_ 0xB000;
+ 616          xdata volatile const BYTE LED3_OFF _at_ 0xB100;
+ 617          // use this global variable when (de)asserting debug LEDs...
+ 618          BYTE xdata ledX_rdvar = 0x00;
+ 619          BYTE xdata LED_State = 0;
+ 620          void LED_Off (BYTE LED_Mask)
+ 621          {
+ 622   1              if (LED_Mask & bmBIT0)
+ 623   1              {
+ 624   2                      ledX_rdvar = LED0_OFF;
+ 625   2                      LED_State &= ~bmBIT0;
+ 626   2              }
+ 627   1              if (LED_Mask & bmBIT1)
+ 628   1              {
+ 629   2                      ledX_rdvar = LED1_OFF;
+ 630   2                      LED_State &= ~bmBIT1;
+ 631   2              }
+ 632   1              if (LED_Mask & bmBIT2)
+ 633   1              {
+ 634   2                      ledX_rdvar = LED2_OFF;
+ 635   2                      LED_State &= ~bmBIT2;
+ 636   2              }
+ 637   1              if (LED_Mask & bmBIT3)
+ 638   1              {
+ 639   2                      ledX_rdvar = LED3_OFF;
+ 640   2                      LED_State &= ~bmBIT3;
+ 641   2              }
+ 642   1      }
+ 643          
+ 644          void LED_On (BYTE LED_Mask)
+ 645          {
+ 646   1              if (LED_Mask & bmBIT0)
+ 647   1              {
+ 648   2                      ledX_rdvar = LED0_ON;
+ 649   2                      LED_State |= bmBIT0;
+ 650   2              }
+ 651   1              if (LED_Mask & bmBIT1)
+ 652   1              {
+ 653   2                      ledX_rdvar = LED1_ON;
+ 654   2                      LED_State |= bmBIT1;
+ 655   2              }
+ 656   1              if (LED_Mask & bmBIT2)
+ 657   1              {
+ 658   2                      ledX_rdvar = LED2_ON;
+ 659   2                      LED_State |= bmBIT2;
+ 660   2              }
+ 661   1              if (LED_Mask & bmBIT3)
+ 662   1              {
+ 663   2                      ledX_rdvar = LED3_ON;
+ 664   2                      LED_State |= bmBIT3;
+ 665   2              }
+ 666   1      }
+ 667          
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   1416    ----
+   CONSTANT SIZE    =   ----    ----
+   XDATA SIZE       =      7    ----
+   PDATA SIZE       =   ----    ----
+C51 COMPILER V8.02   FX2_TO_TI5416_HPI                                                     05/09/2014 16:29:56 PAGE 12  
+
+   DATA SIZE        =      4    ----
+   IDATA SIZE       =   ----    ----
+   BIT SIZE         =      3    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)
